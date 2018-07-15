@@ -2,7 +2,7 @@ import java.nio.file.{Path, Paths}
 
 import cats.Applicative
 import cats.data.Validated.{Invalid, Valid}
-import cats.data.{Validated, ValidatedNel}
+import cats.data.{NonEmptyList, Validated, ValidatedNel}
 import cats.effect.{IO, Sync}
 import io.circe.Json
 import io.circe.generic.auto._
@@ -52,27 +52,30 @@ object Lambda {
       generalDataFrom(data)
     )(InverterSpec)
 
+  private def saveSpec(spec: InverterSpec, path: Path)(implicit amazonDDB: AmazonDDB[IO]): IO[Unit] = for {
+    _ <- amazonDDB.save(path, spec.asJson)
+    _ <- safePrint(s"DONE. Check ${path.toString}")
+  } yield ()
+
+  private def failedSpec(errs: NonEmptyList[PropertyParseError]): IO[Unit] = for {
+    _ <- safePrint("Failed to parse data:")
+    _ <- safePrint(errs.toList)
+    _ <- failLambda("Failed to process spec")
+  } yield ()
+
+
   private def processCsvFile(path: Path)(implicit inputDataFrom: Map[String, String] => Valid[InputData],
                                          outputDataFrom: Map[String, String] => Valid[OutputData],
                                          efficiencyFrom: Map[String, String] => Valid[Efficiency],
                                          generalDataFrom: Map[String, String] => Valid[GeneralData],
-                                         amazonS3: AmazonS3[IO],
-                                         amazonDDB: AmazonDDB[IO]): IO[Unit] = for {
+                                         amazonS3: AmazonS3[IO]): IO[Unit] = for {
     validatedSpec <- amazonS3.getFile(path).map(rawDataToSpec)
     _ <- validatedSpec match {
       case Valid(spec) =>
         val specPath: Path = Paths.get(path.toString.replace(".csv", ".json"))
-        for {
-          _ <- amazonDDB.save(specPath, spec.asJson)
-          _ <- safePrint(s"DONE. Check ${specPath.toString}")
-        } yield ()
+        saveSpec(spec, specPath)
 
-      case Invalid(errs) => for {
-        _ <- safePrint("Failed to parse data:")
-        _ <- safePrint(errs.toList)
-        _ <- failLambda("Failed to process spec")
-      } yield ()
-
+      case Invalid(errs) => failedSpec(errs)
     }
   } yield ()
 
