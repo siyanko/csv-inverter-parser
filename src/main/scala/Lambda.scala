@@ -2,7 +2,7 @@ import java.nio.file.{Path, Paths}
 
 import cats.Applicative
 import cats.data.Validated.{Invalid, Valid}
-import cats.data.ValidatedNel
+import cats.data.{Validated, ValidatedNel}
 import cats.effect.{IO, Sync}
 import io.circe.Json
 import io.circe.generic.auto._
@@ -36,15 +36,15 @@ object Lambda {
         .compile.drain
   }
 
-  def failLambda(msg: FailMessage): IO[Unit] = IO {
+  private def failLambda(msg: FailMessage): IO[Unit] = IO {
     throw new RuntimeException(msg)
   }
 
-  def rawDataToSpec(implicit inputDataFrom: Map[String, String] => Valid[InputData],
-                    outputDataFrom: Map[String, String] => Valid[OutputData],
-                    efficiencyFrom: Map[String, String] => Valid[Efficiency],
-                    generalDataFrom: Map[String, String] => Valid[GeneralData]
-                   ): Map[String, String] => Valid[InverterSpec] = data =>
+  private def rawDataToSpec(implicit inputDataFrom: Map[String, String] => Valid[InputData],
+                            outputDataFrom: Map[String, String] => Valid[OutputData],
+                            efficiencyFrom: Map[String, String] => Valid[Efficiency],
+                            generalDataFrom: Map[String, String] => Valid[GeneralData]
+                           ): Map[String, String] => Valid[InverterSpec] = data =>
     Applicative[Valid].map4(
       inputDataFrom(data),
       outputDataFrom(data),
@@ -52,34 +52,51 @@ object Lambda {
       generalDataFrom(data)
     )(InverterSpec)
 
-  def program(path: String)(implicit inputDataFrom: Map[String, String] => Valid[InputData],
-                            outputDataFrom: Map[String, String] => Valid[OutputData],
-                            efficiencyFrom: Map[String, String] => Valid[Efficiency],
-                            generalDataFrom: Map[String, String] => Valid[GeneralData],
-                            amazonS3: AmazonS3[IO],
-                            amazonDDB: AmazonDDB[IO]): IO[Unit] = for {
-    validatedSpec <- amazonS3.getFile(Paths.get(path)).map(rawDataToSpec)
+  private def processCsvFile(path: Path)(implicit inputDataFrom: Map[String, String] => Valid[InputData],
+                                         outputDataFrom: Map[String, String] => Valid[OutputData],
+                                         efficiencyFrom: Map[String, String] => Valid[Efficiency],
+                                         generalDataFrom: Map[String, String] => Valid[GeneralData],
+                                         amazonS3: AmazonS3[IO],
+                                         amazonDDB: AmazonDDB[IO]): IO[Unit] = for {
+    validatedSpec <- amazonS3.getFile(path).map(rawDataToSpec)
     _ <- validatedSpec match {
       case Valid(spec) =>
-        val specPath: Path = Paths.get(path.replace(".csv", ".json"))
+        val specPath: Path = Paths.get(path.toString.replace(".csv", ".json"))
         for {
           _ <- amazonDDB.save(specPath, spec.asJson)
-          _ <- IO {
-            println(s"DONE. Check ${specPath.toString}")
-          }
+          _ <- safePrint(s"DONE. Check ${specPath.toString}")
         } yield ()
 
       case Invalid(errs) => for {
-        _ <- IO {
-          println("Failed to parse data:")
-          errs.toList.foreach(println)
-        }
+        _ <- safePrint("Failed to parse data:")
+        _ <- safePrint(errs.toList)
         _ <- failLambda("Failed to process spec")
       } yield ()
 
     }
+  } yield ()
+
+  private def validate(path: String): IO[ValidatedNel[String, Path]] = IO {
+    Validated.condNel(path.endsWith(".csv"), Paths.get(path), "Not a csv file: " + path)
   }
 
-    yield ()
+  private def safePrint(s: String): IO[Unit] = IO {
+    println(s)
+  }
+
+  private def safePrint[A](ls: List[A]): IO[Unit] = IO {
+    ls.foreach(println)
+  }
+
+  def program(path: String)(implicit inputDataFrom: Map[String, String] => Valid[InputData],
+                            outputDataFrom: Map[String, String] => Valid[OutputData],
+                            efficiencyFrom: Map[String, String] => Valid[Efficiency],
+                            generalDataFrom: Map[String, String] => Valid[GeneralData]): IO[Unit] = for {
+    pathValidationResult <- validate(path)
+    _ <- pathValidationResult match {
+      case Valid(path) => processCsvFile(path)
+      case Invalid(err) => safePrint(err.toList)
+    }
+  } yield ()
 
 }
